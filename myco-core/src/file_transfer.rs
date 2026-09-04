@@ -25,6 +25,14 @@ pub const OFFER_TTL_SECS: u64 = 10 * 60;
 /// message is sent again. Long enough that a reply in flight over a slow
 /// multi-hop path is not doubled, short against the offer TTL.
 pub const RESEND_AFTER_SECS: u64 = 12;
+/// The encrypted package download fails once the peer has sent nothing for
+/// this long. There is deliberately no cap on total duration: a multi-megabyte
+/// file over a Bluetooth hop takes minutes and is still making progress.
+pub const DOWNLOAD_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How many times a download is started before the transfer is failed; a
+/// mesh link that flaps mid-body comes back within seconds.
+pub const DOWNLOAD_ATTEMPTS: u32 = 4;
+pub const DOWNLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 /// How many transfers this device will track at once. A Circle member that
 /// spams offers would otherwise grow `file_transfers.json` without bound; past
 /// this the oldest finished rows go first, and new offers are refused outright

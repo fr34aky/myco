@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every twelve seconds or so until the transfer moves on or expires — and a
   receiver that already has the file answers a repeated "ready" with a fresh
   "done", so a sender no longer sits on "Sending" after a delivered file.
+- Receiving a large file over Bluetooth no longer fails part-way with
+  "error decoding response body". The download used to give up after two
+  minutes in total, which a few megabytes over a slow hop exceeds while still
+  arriving; it now only gives up when nothing has arrived for thirty seconds,
+  and a connection that drops mid-file is tried again a few times first.
 
 ## [0.6.0] - 2026-08-19
 
