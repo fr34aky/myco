@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Wi-Fi Aware carries several phones at once instead of one. The lane ran a
+  single UDP socket, and Android lets a socket serve only one Wi-Fi Aware
+  connection, so a second phone's link came up and then went quiet — the
+  hardware was never the limit. Each phone now gets a socket of its own, up to
+  four at a time.
+
+### Added
+
+- Send a file from the Circle tab: tapping a paired contact now offers
+  "Send a file" next to their npub and "Remove from circle". Pick the files
+  and they go out the same encrypted mesh transfer the system Sharesheet
+  uses — to the contact's npub, over whatever path reaches them, without
+  needing a shared Wi-Fi.
 ### Fixed
 
 - Same-Wi-Fi peers that dropped off mDNS now reconnect on their own: the
@@ -14,7 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reporting is found again, instead of the connection staying dead.
 
 ### Added
-
 - Phones on the same Wi-Fi now find each other over the network instead of
   Bluetooth. Myco announces itself on the local network the same way a fips
   node does, so two phones — or a phone and a desktop — on one Wi-Fi connect
@@ -26,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transfers appear on the Circle tab alongside pairing requests, so a send that
   is still waiting is visible from anywhere in the app and can be cancelled.
   An offer nobody answers gives up after ten minutes instead of waiting forever.
+
+### Fixed
+
+- A file transfer no longer gets stuck when a control message is lost. An
+  accept (or offer, or ready) sent while the Bluetooth link was re-dialling
+  was dropped, and the other side waited the full ten minutes before giving
+  up. Each side now re-sends the message it is still waiting to have heard,
+  every twelve seconds or so until the transfer moves on or expires — and a
+  receiver that already has the file answers a repeated "ready" with a fresh
+  "done", so a sender no longer sits on "Sending" after a delivered file.
+- Receiving a large file over Bluetooth no longer fails part-way with
+  "error decoding response body". The download used to give up after two
+  minutes in total, which a few megabytes over a slow hop exceeds while still
+  arriving; it now only gives up when nothing has arrived for thirty seconds,
+  and a connection that drops mid-file is tried again a few times first.
 
 ## [0.6.0] - 2026-08-19
 
