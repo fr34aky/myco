@@ -432,12 +432,17 @@ pub struct Content {
     /// Native paired-peer file transfers. Metadata is persisted; file keys and
     /// encrypted outbox paths remain inside the app-private data directory.
     file_transfers: Mutex<Vec<FileTransferRecord>>,
-    /// Incoming transfers this device finished, newest last. The row itself is
-    /// forgotten as soon as the shell publishes the file, but the sender may
-    /// still be retrying its `ready` if our `complete` was lost — this is what
-    /// lets a late `ready` be answered with a fresh `complete` rather than
-    /// refused as unknown. Memory only; a restart simply stops answering.
-    completed_incoming: Mutex<VecDeque<String>>,
+    /// Incoming transfers this device finished, newest last, as `(id, peer)`.
+    /// The row itself is forgotten as soon as the shell publishes the file, but
+    /// the sender may still be retrying its `ready` if our `complete` was lost —
+    /// this is what lets a late `ready` be answered with a fresh `complete`
+    /// rather than refused as unknown. The peer is kept alongside the id so an
+    /// answer goes only to the peer the transfer was with; every other check on
+    /// that path binds the peer, and this one must too. Persisted, so a restart
+    /// in the window between publishing the file and the sender giving up does
+    /// not cost them the whole offer TTL.
+    completed_incoming: Mutex<VecDeque<(String, String)>>,
+    completed_incoming_path: PathBuf,
     file_transfers_path: PathBuf,
     file_outbox_dir: PathBuf,
     received_dir: PathBuf,
@@ -603,6 +608,8 @@ impl Content {
         let active_manifests = load_active(&active_path);
         let file_transfers_path = data_dir.join("file_transfers.json");
         let file_transfers = load_file_transfers(&file_transfers_path);
+        let completed_incoming_path = data_dir.join("completed_transfers.json");
+        let completed_incoming = load_completed_incoming(&completed_incoming_path);
         let file_outbox_dir = data_dir.join("file-outbox");
         let received_dir = data_dir.join("received");
         let _ = std::fs::create_dir_all(&file_outbox_dir);
@@ -634,7 +641,8 @@ impl Content {
             pending_updates: Mutex::new(HashMap::new()),
             update_check: Mutex::new(UpdateCheckView::default()),
             file_transfers: Mutex::new(file_transfers),
-            completed_incoming: Mutex::new(VecDeque::new()),
+            completed_incoming: Mutex::new(completed_incoming),
+            completed_incoming_path,
             file_transfers_path,
             file_outbox_dir,
             received_dir,
@@ -2023,7 +2031,7 @@ impl Content {
                     // A `ready` for a transfer we already finished means our
                     // `complete` never reached the sender: answer it again so
                     // their row stops retrying and clears.
-                    if self.was_completed_incoming(&transfer_id) {
+                    if self.was_completed_incoming(&transfer_id, &sender_npub) {
                         let content = Arc::clone(self);
                         tokio::spawn(async move {
                             if let Err(e) = content.send_complete(&transfer_id, &sender_npub).await
@@ -2251,7 +2259,7 @@ impl Content {
             r.view.updated_at = file_transfer::now_secs();
             r.key_b64 = None;
         });
-        self.remember_completed_incoming(transfer_id);
+        self.remember_completed_incoming(transfer_id, sender_npub);
         if let Err(e) = self.send_complete(transfer_id, sender_npub).await {
             // The receiver's local copy is already complete. A failed sender
             // acknowledgement must not turn this back into a failed transfer
@@ -2282,21 +2290,27 @@ impl Content {
         self.send_file_message(&target, sender_npub, message).await
     }
 
-    fn remember_completed_incoming(&self, transfer_id: &str) {
-        let mut done = self.completed_incoming.lock().unwrap();
-        done.retain(|id| id != transfer_id);
-        done.push_back(transfer_id.to_string());
-        while done.len() > file_transfer::MAX_TRACKED_TRANSFERS {
-            done.pop_front();
-        }
+    fn remember_completed_incoming(&self, transfer_id: &str, peer_npub: &str) {
+        let snapshot = {
+            let mut done = self.completed_incoming.lock().unwrap();
+            done.retain(|(id, _)| id != transfer_id);
+            done.push_back((transfer_id.to_string(), peer_npub.to_string()));
+            while done.len() > file_transfer::MAX_TRACKED_TRANSFERS {
+                done.pop_front();
+            }
+            done.clone()
+        };
+        save_completed_incoming(&self.completed_incoming_path, &snapshot);
     }
 
-    pub(crate) fn was_completed_incoming(&self, transfer_id: &str) -> bool {
+    /// Whether `transfer_id` is one we finished **with this peer**. Matching on
+    /// the id alone would answer any Circle member who guessed it.
+    pub(crate) fn was_completed_incoming(&self, transfer_id: &str, peer_npub: &str) -> bool {
         self.completed_incoming
             .lock()
             .unwrap()
             .iter()
-            .any(|id| id == transfer_id)
+            .any(|(id, peer)| id == transfer_id && peer == peer_npub)
     }
 
     async fn send_file_message(
@@ -2516,6 +2530,9 @@ impl Content {
             return Vec::new();
         };
         let Ok(own_npub) = keys.public_key().to_bech32();
+        // Taken before the transfer lock, never under it: every other path
+        // takes the Circle lock first.
+        let circle: HashSet<String> = self.circle_npubs().into_iter().collect();
         let mut out = Vec::new();
         let snapshot = {
             let mut records = self.file_transfers.lock().unwrap();
@@ -2526,7 +2543,24 @@ impl Content {
                 {
                     continue;
                 }
-                let message = match (r.view.direction.as_str(), r.view.status.as_str()) {
+                // Removing someone stops us talking to them. Their side drops a
+                // message from a non-Circle sender anyway; retrying at a person
+                // just removed is the part that would be wrong.
+                if !circle.contains(&r.view.peer_npub) {
+                    continue;
+                }
+                let state = (r.view.direction.as_str(), r.view.status.as_str());
+                if !matches!(
+                    state,
+                    ("outgoing", "offered") | ("incoming", "accepted") | ("outgoing", "ready")
+                ) {
+                    continue;
+                }
+                // Stamped before the message is built, so a row we cannot
+                // rebuild waits out the window like any other rather than
+                // retrying the same failing work every tick.
+                r.last_resend_at = now;
+                let message = match state {
                     ("outgoing", "offered") => FileMessage::Offer {
                         transfer_id: r.view.id.clone(),
                         sender_npub: own_npub.clone(),
@@ -2571,7 +2605,6 @@ impl Content {
                     }
                     _ => continue,
                 };
-                r.last_resend_at = now;
                 out.push((r.view.peer_npub.clone(), message));
             }
             records.clone()
@@ -3661,6 +3694,20 @@ fn save_file_transfers(path: &Path, items: &[FileTransferRecord]) {
     }
 }
 
+fn load_completed_incoming(path: &Path) -> VecDeque<(String, String)> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_completed_incoming(path: &Path, items: &VecDeque<(String, String)>) {
+    if let Ok(json) = serde_json::to_vec(items) {
+        let tmp = path.with_extension("json.tmp");
+        let _ = std::fs::write(&tmp, &json).and_then(|_| std::fs::rename(&tmp, path));
+    }
+}
+
 fn load_circle(path: &Path) -> Vec<CircleContact> {
     std::fs::read(path)
         .ok()
@@ -4003,6 +4050,7 @@ mod tests {
         let content = Content::open(&dir).unwrap();
         content.set_device_keys(&Keys::generate().secret_key().to_bech32().unwrap());
         let peer = Keys::generate().public_key().to_bech32().unwrap();
+        content.add_to_circle(&peer, "peer");
         let now = 1_000_000;
         let mut offered = incoming_record("offered", now + 60);
         offered.view.direction = "outgoing".to_string();
@@ -4015,13 +4063,22 @@ mod tests {
         accepted.view.updated_at = now - 30;
         let mut fresh = incoming_record("fresh", now + 60);
         fresh.view.status = "accepted".to_string();
+        fresh.view.peer_npub = peer.clone();
         fresh.view.updated_at = now - 2;
         let mut waiting = incoming_record("waiting", now + 60);
+        waiting.view.peer_npub = peer.clone();
         waiting.view.updated_at = now - 30;
         let mut expired = incoming_record("expired", now - 1);
         expired.view.status = "accepted".to_string();
+        expired.view.peer_npub = peer.clone();
         expired.view.updated_at = now - 30;
-        for r in [offered, accepted, fresh, waiting, expired] {
+        // Removed from the Circle mid-transfer: we stop talking to them.
+        let removed_peer = Keys::generate().public_key().to_bech32().unwrap();
+        let mut removed = incoming_record("removed", now + 60);
+        removed.view.status = "accepted".to_string();
+        removed.view.peer_npub = removed_peer;
+        removed.view.updated_at = now - 30;
+        for r in [offered, accepted, fresh, waiting, expired, removed] {
             content.insert_file_transfer(r);
         }
 
@@ -4044,7 +4101,8 @@ mod tests {
                 (peer.clone(), "accepted:accept".to_string()),
                 (peer, "offered:offer".to_string())
             ],
-            "only the rows waiting on the other side, and only once they have stalled"
+            "only the rows waiting on the other side, with a peer still in the Circle, \
+             and only once they have stalled"
         );
         assert!(
             content.stalled_file_messages(now + 5).is_empty(),
@@ -4071,21 +4129,34 @@ mod tests {
         let dir = tmp("file-completed-memory");
         let _ = std::fs::remove_dir_all(&dir);
         let content = Content::open(&dir).unwrap();
-        assert!(!content.was_completed_incoming("t1"));
-        content.remember_completed_incoming("t1");
+        let peer = Keys::generate().public_key().to_bech32().unwrap();
+        let other = Keys::generate().public_key().to_bech32().unwrap();
+        assert!(!content.was_completed_incoming("t1", &peer));
+        content.remember_completed_incoming("t1", &peer);
         content.forget_file_transfer("t1");
         assert!(
-            content.was_completed_incoming("t1"),
+            content.was_completed_incoming("t1", &peer),
             "forgetting the row must not forget the id"
         );
+        assert!(
+            !content.was_completed_incoming("t1", &other),
+            "another Circle member asking about the same id is not answered"
+        );
+        // A restart between publishing the file and the sender giving up must
+        // not cost them the rest of the offer TTL.
+        let reopened = Content::open(&dir).unwrap();
+        assert!(
+            reopened.was_completed_incoming("t1", &peer),
+            "the memory has to survive a restart"
+        );
         for i in 0..file_transfer::MAX_TRACKED_TRANSFERS {
-            content.remember_completed_incoming(&format!("later-{i}"));
+            content.remember_completed_incoming(&format!("later-{i}"), &peer);
         }
         assert!(
-            !content.was_completed_incoming("t1"),
+            !content.was_completed_incoming("t1", &peer),
             "the oldest id is evicted at the cap"
         );
-        assert!(content.was_completed_incoming("later-0"));
+        assert!(content.was_completed_incoming("later-0", &peer));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
