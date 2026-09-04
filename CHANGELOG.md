@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and they go out the same encrypted mesh transfer the system Sharesheet
   uses — to the contact's npub, over whatever path reaches them, without
   needing a shared Wi-Fi.
+- Phones on the same Wi-Fi now find each other over the network instead of
+  Bluetooth. Myco announces itself on the local network the same way a fips
+  node does, so two phones — or a phone and a desktop — on one Wi-Fi connect
+  over UDP, which moves a file in seconds rather than minutes.
 - Send a file straight to a paired phone. Share anything from another app, pick
   one of your paired phones, and it arrives encrypted over the mesh — no
   hotspot, no internet. The receiving phone is asked first and can say no, and

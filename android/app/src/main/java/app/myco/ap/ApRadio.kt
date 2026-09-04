@@ -25,15 +25,19 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * The `!FIPS` access-point lane. When the phone associates with a FIPS AP's
- * open `!FIPS` SSID (or any LAN carrying a fips node), this connects the app's
- * node to the AP's fips node over the ordinary UDP transport:
+ * The LAN lane (born as the `!FIPS` access-point lane). When the phone is on
+ * any Wi-Fi — a FIPS AP's open `!FIPS` SSID, or a home network shared with
+ * another Myco phone or a desktop — this connects the app's node to the other
+ * fips nodes there over the ordinary UDP transport:
  *
  *  1. watch infrastructure Wi-Fi via a [ConnectivityManager.NetworkCallback]
  *     (passive, permissionless);
  *  2. while any Wi-Fi is up, browse mDNS for `_fips._udp` — the advert fips
  *     LAN discovery publishes (`reference/fips` `src/discovery/lan`), whose
  *     TXT carries the node's `npub`;
+ *  2b. and publish the same advert for ourselves ([startAdvert]), so the
+ *     other side finds us too — two phones on one Wi-Fi meet here instead of
+ *     over BLE;
  *  3. on resolve, push `(npub, addr)` into the core's platform peer queue
  *     ([NativeCore.awarePeerFound], lane `"udp"`) — the same seam the Wi-Fi
  *     Aware radio uses, labelled with this lane's own name rather than
@@ -103,6 +107,7 @@ class ApRadio private constructor(private val context: Context) {
     private var resolving = false
     private var browsing = false
     private var browseListener: NsdManager.DiscoveryListener? = null
+    private var advert: NsdManager.RegistrationListener? = null
     private var ssid: String? = null
 
     /** Pins this lane's UDP transport socket to the current Wi-Fi [Network] —
@@ -111,10 +116,22 @@ class ApRadio private constructor(private val context: Context) {
      *  never Wi-Fi Aware's. */
     private val udpPin = UdpSocketPin(LANE, handler, TAG)
 
-    /** Own npub, to skip a self-advert (defensive — the app never publishes
-     *  mDNS, only browses). Resolved lazily; the core is up by first resolve. */
-    private val ownNpub: String by lazy {
-        runCatching { MycoCore.client(context).state().ownNpub }.getOrDefault("")
+    /** Own npub: skipped when it comes back from the browse as our own advert,
+     *  and carried in the advert we publish.
+     *
+     *  Read on demand and cached only once it is non-empty. The first read can
+     *  land before the core is up — first Wi-Fi does not wait for mesh — and
+     *  caching that empty answer would be permanent: the advert retry would
+     *  spin forever without ever publishing, and every browse hit would fail
+     *  the self-advert check and push us at ourselves as a peer. */
+    @Volatile
+    private var ownNpubCache: String = ""
+
+    private fun ownNpub(): String {
+        ownNpubCache.takeIf { it.isNotEmpty() }?.let { return it }
+        val npub = runCatching { MycoCore.client(context).state().ownNpub }.getOrDefault("")
+        if (npub.isNotEmpty()) ownNpubCache = npub
+        return npub
     }
 
     private inner class WifiCallback : ConnectivityManager.NetworkCallback {
@@ -124,7 +141,10 @@ class ApRadio private constructor(private val context: Context) {
         constructor(flags: Int) : super(flags)
 
         override fun onAvailable(network: Network) {
-            if (wifiNets.add(network) && wifiNets.size == 1) startBrowse()
+            if (wifiNets.add(network) && wifiNets.size == 1) {
+                startBrowse()
+                startAdvert()
+            }
             udpPin.bindTo(network)
             publishWifi()
         }
@@ -139,6 +159,7 @@ class ApRadio private constructor(private val context: Context) {
             if (wifiNets.remove(network) && wifiNets.isEmpty()) {
                 ssid = null
                 stopBrowse()
+                stopAdvert()
             }
             publishWifi()
         }
@@ -229,6 +250,68 @@ class ApRadio private constructor(private val context: Context) {
         publishWifi()
     }
 
+    // --- mDNS advert ---
+
+    /** Publish our own `_fips._udp` advert on this Wi-Fi, so a peer browsing it
+     *  (another phone, a desktop, a fips node with LAN rendezvous on) learns
+     *  `(npub, this address, :4871)` and dials the LAN lane's socket directly.
+     *  Without this the lane was one-way: a phone could find an advertising
+     *  node but two phones on the same Wi-Fi never found each other, and fell
+     *  back to BLE at a fraction of the throughput.
+     *
+     *  The TXT mirrors the fips advert (`reference/fips` `src/mdns`): `npub`
+     *  and `v=1`, so the same browser code serves both. A fixed port is
+     *  advertised rather than the socket's: the core binds the LAN lane to
+     *  [LAN_UDP_PORT] unconditionally, and `NsdManager` needs a port at
+     *  registration time, before mesh is necessarily on. A dial that lands on
+     *  a closed port simply goes unanswered until the node is up. */
+    private fun startAdvert() {
+        if (advert != null || wifiNets.isEmpty()) return
+        val npub = ownNpub()
+        if (npub.isEmpty()) {
+            handler.postDelayed({ startAdvert() }, ADVERT_RETRY_MS)
+            return
+        }
+        val info = NsdServiceInfo().apply {
+            serviceName = "myco-" + npub.takeLast(8)
+            serviceType = SERVICE_TYPE
+            port = LAN_UDP_PORT
+            setAttribute(TXT_NPUB, npub)
+            setAttribute("v", "1")
+        }
+        val listener = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(registered: NsdServiceInfo) {
+                Log.i(TAG, "advert up: ${registered.serviceName} $SERVICE_TYPE:$LAN_UDP_PORT")
+            }
+
+            override fun onRegistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                Log.w(TAG, "advert failed ($errorCode); retrying")
+                handler.post {
+                    if (advert === this) advert = null
+                    handler.postDelayed({ startAdvert() }, ADVERT_RETRY_MS)
+                }
+            }
+
+            override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) {}
+
+            override fun onUnregistrationFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                Log.w(TAG, "advert unregister failed ($errorCode)")
+            }
+        }
+        advert = listener
+        runCatching { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) }
+            .onFailure {
+                Log.w(TAG, "advert registration threw", it)
+                advert = null
+                handler.postDelayed({ startAdvert() }, ADVERT_RETRY_MS)
+            }
+    }
+
+    private fun stopAdvert() {
+        advert?.let { runCatching { nsd.unregisterService(it) } }
+        advert = null
+    }
+
     /** Periodic tick while the browse is live: advance an *unconnected* peer to
      *  its next candidate address.
      *
@@ -293,7 +376,7 @@ class ApRadio private constructor(private val context: Context) {
         val npub = info.attributes[TXT_NPUB]?.toString(Charsets.UTF_8)
             ?.takeIf { it.startsWith("npub1") }
             ?: run { Log.w(TAG, "advert ${info.serviceName} has no npub TXT"); return }
-        if (npub == ownNpub) return
+        if (npub == ownNpub()) return
         val addrs = pickAddrs(info)
         if (addrs.isEmpty()) {
             Log.w(TAG, "no dialable address for ${short(npub)} (${info.serviceName})")
@@ -470,6 +553,12 @@ class ApRadio private constructor(private val context: Context) {
          *  nothing is connected, and an established session is worth far more
          *  than shaving seconds off finding one. */
         private const val REPUSH_MS = 35_000L
+
+        /** The LAN lane's fixed UDP port — `LAN_UDP_PORT` in `runtime.rs`. */
+        private const val LAN_UDP_PORT = 4871
+
+        /** Retry cadence for an advert that could not be registered yet. */
+        private const val ADVERT_RETRY_MS = 5_000L
 
         private val _wifi = MutableStateFlow(WifiApView())
         private val _nodes = MutableStateFlow<List<LanFipsNode>>(emptyList())
