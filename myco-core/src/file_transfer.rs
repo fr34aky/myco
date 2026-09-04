@@ -21,6 +21,10 @@ pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 /// paired peer cannot answer a small offer with an unbounded body.
 pub const MAX_PACKAGE_BYTES: u64 = MAX_FILE_BYTES as u64 + MAGIC.len() as u64 + 24 + 16;
 pub const OFFER_TTL_SECS: u64 = 10 * 60;
+/// How long a transfer may sit in one state before its pending control
+/// message is sent again. Long enough that a reply in flight over a slow
+/// multi-hop path is not doubled, short against the offer TTL.
+pub const RESEND_AFTER_SECS: u64 = 12;
 /// The encrypted package download fails once the peer has sent nothing for
 /// this long. There is deliberately no cap on total duration: a multi-megabyte
 /// file over a Bluetooth hop takes minutes and is still making progress.
@@ -73,6 +77,10 @@ pub(crate) struct FileTransferRecord {
     #[serde(default)]
     pub ciphertext_size: u64,
     pub expires_at: u64,
+    /// When the pending control message was last re-sent (see
+    /// `Content::stalled_file_messages`). Zero until the first retry.
+    #[serde(default)]
+    pub last_resend_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

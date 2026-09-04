@@ -10,13 +10,14 @@ on:
 
 env:
   # `fips` is a gitignored local path dep (reference/fips). A fresh checkout has no
-  # reference/ at all, so clone the branch carrying the mobile seams: Android
-  # BLE as a backend behind the existing `BleIo` trait, per-instance transport
-  # addressing (the LAN and Wi-Fi Aware lanes need one UDP socket each), and the
-  # app-owned TUN/UDP/radio seams. Built on current fips master; each commit is
-  # shaped to be cherry-picked upstream on its own.
+  # reference/ at all, so clone it here.
+  #
+  # The mobile seams this app builds on — Android BLE as a backend behind the
+  # existing `BleIo` trait, per-instance transport addressing (the LAN and
+  # Wi-Fi Aware lanes need one UDP socket each), the app-owned TUN/UDP/radio
+  # seams — are upstream on master now, so master is what we build against.
   FIPS_REPO: https://github.com/jmcorgan/fips.git
-  FIPS_REF: integration/platform
+  FIPS_REF: master
   NDK_VERSION: 26.1.10909125
   CARGO_TERM_COLOR: always
 
