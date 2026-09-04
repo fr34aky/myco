@@ -117,10 +117,21 @@ class ApRadio private constructor(private val context: Context) {
     private val udpPin = UdpSocketPin(LANE, handler, TAG)
 
     /** Own npub: skipped when it comes back from the browse as our own advert,
-     *  and carried in the advert we publish. Resolved lazily; the core is up by
-     *  first Wi-Fi, and [startAdvert] retries until it is. */
-    private val ownNpub: String by lazy {
-        runCatching { MycoCore.client(context).state().ownNpub }.getOrDefault("")
+     *  and carried in the advert we publish.
+     *
+     *  Read on demand and cached only once it is non-empty. The first read can
+     *  land before the core is up — first Wi-Fi does not wait for mesh — and
+     *  caching that empty answer would be permanent: the advert retry would
+     *  spin forever without ever publishing, and every browse hit would fail
+     *  the self-advert check and push us at ourselves as a peer. */
+    @Volatile
+    private var ownNpubCache: String = ""
+
+    private fun ownNpub(): String {
+        ownNpubCache.takeIf { it.isNotEmpty() }?.let { return it }
+        val npub = runCatching { MycoCore.client(context).state().ownNpub }.getOrDefault("")
+        if (npub.isNotEmpty()) ownNpubCache = npub
+        return npub
     }
 
     private inner class WifiCallback : ConnectivityManager.NetworkCallback {
@@ -256,7 +267,7 @@ class ApRadio private constructor(private val context: Context) {
      *  a closed port simply goes unanswered until the node is up. */
     private fun startAdvert() {
         if (advert != null || wifiNets.isEmpty()) return
-        val npub = ownNpub
+        val npub = ownNpub()
         if (npub.isEmpty()) {
             handler.postDelayed({ startAdvert() }, ADVERT_RETRY_MS)
             return
@@ -365,7 +376,7 @@ class ApRadio private constructor(private val context: Context) {
         val npub = info.attributes[TXT_NPUB]?.toString(Charsets.UTF_8)
             ?.takeIf { it.startsWith("npub1") }
             ?: run { Log.w(TAG, "advert ${info.serviceName} has no npub TXT"); return }
-        if (npub == ownNpub) return
+        if (npub == ownNpub()) return
         val addrs = pickAddrs(info)
         if (addrs.isEmpty()) {
             Log.w(TAG, "no dialable address for ${short(npub)} (${info.serviceName})")
