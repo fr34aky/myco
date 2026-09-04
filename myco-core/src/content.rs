@@ -2156,16 +2156,31 @@ impl Content {
         } else {
             declared_size.min(file_transfer::MAX_PACKAGE_BYTES)
         };
-        crate::dns_intercept::warm_route(sender_npub);
         let base = crate::ip_source::mesh_blossom_url(sender_npub);
         let url = format!("{base}/{blob_hash}");
+        // Nothing about this download is bounded by total time any more, so the
+        // row's own state is what ends it: the user cancelling, or the sweeper
+        // failing an expired offer, must stop the fetch rather than have it
+        // finish minutes later and publish a file that was called off.
+        let still_wanted =
+            || self.transfer_in_state(transfer_id, "incoming", sender_npub, &["downloading"]);
         // A mesh hop can be slow and can drop mid-body, so the fetch is bounded
         // by silence rather than by total time, and a cut connection is tried
         // again a few times before the transfer is failed.
         let mut attempt = 0;
         let package = loop {
             attempt += 1;
-            match Self::fetch_package(&url, limit, file_transfer::DOWNLOAD_IDLE_TIMEOUT).await {
+            // Re-warmed per attempt: a retry is usually a link that just
+            // flapped, and the route it flapped away from is the stale one.
+            crate::dns_intercept::warm_route(sender_npub);
+            match Self::fetch_package(
+                &url,
+                limit,
+                file_transfer::DOWNLOAD_IDLE_TIMEOUT,
+                &still_wanted,
+            )
+            .await
+            {
                 Ok(package) => break package,
                 Err(e) if attempt < file_transfer::DOWNLOAD_ATTEMPTS && is_transport_error(&e) => {
                     tracing::warn!(
@@ -2175,10 +2190,16 @@ impl Content {
                         "file share: download interrupted, retrying"
                     );
                     tokio::time::sleep(file_transfer::DOWNLOAD_RETRY_DELAY).await;
+                    if !still_wanted() {
+                        anyhow::bail!("transfer is no longer being downloaded");
+                    }
                 }
                 Err(e) => return Err(e),
             }
         };
+        if !still_wanted() {
+            anyhow::bail!("transfer is no longer being downloaded");
+        }
         if file_transfer::sha256_hex(&package) != blob_hash {
             anyhow::bail!("downloaded encrypted blob hash mismatch");
         }
@@ -2214,7 +2235,17 @@ impl Content {
     /// and while the body streams in, and failed if the peer goes quiet for
     /// [`file_transfer::DOWNLOAD_IDLE_TIMEOUT`] — not by total duration, which
     /// a large file over a slow Bluetooth hop legitimately exceeds.
-    async fn fetch_package(url: &str, limit: u64, idle: Duration) -> anyhow::Result<Vec<u8>> {
+    ///
+    /// `still_wanted` is asked between chunks, and answering `false` ends the
+    /// fetch. With no total bound, a peer trickling a byte before every idle
+    /// timeout would otherwise hold this task and its buffer for as long as it
+    /// liked, whatever the row said.
+    async fn fetch_package(
+        url: &str,
+        limit: u64,
+        idle: Duration,
+        still_wanted: &(dyn Fn() -> bool + Sync),
+    ) -> anyhow::Result<Vec<u8>> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .build()?;
@@ -2241,6 +2272,9 @@ impl Content {
                 anyhow::bail!("peer sent more than the {limit} bytes it declared");
             }
             package.extend_from_slice(&chunk);
+            if !still_wanted() {
+                anyhow::bail!("transfer is no longer being downloaded");
+            }
         }
         Ok(package)
     }
@@ -3877,33 +3911,43 @@ mod tests {
         tokio::spawn(async move {
             // First request: 8 bytes, drip-fed slower than the old total cap
             // would scale to. Second: 8 bytes promised, 4 sent, then silence.
-            for stalls in [false, true] {
+            // Third: another trickle, for the abandoned case. Each is served on
+            // its own task, so the one that goes quiet does not hold up the
+            // next connection.
+            for stalls in [false, true, false] {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n")
-                    .await
-                    .unwrap();
-                for i in 0..8u8 {
-                    if stalls && i == 4 {
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        break;
+                tokio::spawn(async move {
+                    sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n")
+                        .await
+                        .unwrap();
+                    for i in 0..8u8 {
+                        if stalls && i == 4 {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            break;
+                        }
+                        sock.write_all(&[i]).await.unwrap();
+                        sock.flush().await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(150)).await;
                     }
-                    sock.write_all(&[i]).await.unwrap();
-                    sock.flush().await.unwrap();
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                }
+                });
             }
         });
         let url = format!("http://127.0.0.1:{port}/blob");
         let idle = Duration::from_millis(600);
 
-        let slow = Content::fetch_package(&url, 1024, idle).await.unwrap();
+        let wanted = || true;
+        let slow = Content::fetch_package(&url, 1024, idle, &wanted)
+            .await
+            .unwrap();
         assert_eq!(
             slow,
             (0..8u8).collect::<Vec<_>>(),
             "a trickle still completes"
         );
 
-        let stalled = Content::fetch_package(&url, 1024, idle).await.unwrap_err();
+        let stalled = Content::fetch_package(&url, 1024, idle, &wanted)
+            .await
+            .unwrap_err();
         assert!(
             stalled.to_string().starts_with("download stalled"),
             "silence must fail the fetch: {stalled}"
@@ -3912,6 +3956,20 @@ mod tests {
         assert!(
             !is_transport_error(&anyhow::anyhow!("downloaded encrypted blob hash mismatch")),
             "a wrong answer from the peer is not retried"
+        );
+
+        // Cancelled, or swept after the offer expired: the fetch stops instead
+        // of finishing minutes later and publishing a file nobody wants.
+        let abandoned = Content::fetch_package(&url, 1024, idle, &|| false)
+            .await
+            .unwrap_err();
+        assert!(
+            abandoned.to_string().starts_with("transfer is no longer"),
+            "a row that left `downloading` ends the fetch: {abandoned}"
+        );
+        assert!(
+            !is_transport_error(&abandoned),
+            "and is not treated as a connection fault worth retrying"
         );
     }
 
