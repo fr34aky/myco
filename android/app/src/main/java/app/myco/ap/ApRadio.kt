@@ -191,18 +191,35 @@ class ApRadio private constructor(private val context: Context) {
     private fun startBrowse() {
         if (browseListener != null) return
         // A DiscoveryListener is single-use: a fresh one per browse session.
+        //
+        // Every callback checks it is still the current listener before doing
+        // anything. [rediscover] replaces the listener on a timer, and the old
+        // one's callbacks keep arriving after the new browse is up: a stale
+        // `onDiscoveryStopped` would report we are not looking while we are, a
+        // stale `onStartDiscoveryFailed` would null out the live listener (so
+        // nothing could stop it and a second browse could start), and a stale
+        // `onServiceLost` would strand exactly the peer this restart exists to
+        // recover.
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {
                 handler.post {
+                    if (browseListener !== this) return@post
                     browsing = true
                     publishWifi()
+                    // Remove-before-post: onDiscoveryStarted fires again on
+                    // every rediscover restart, so a bare postDelayed would
+                    // stack a fresh copy of each timer every cycle.
+                    handler.removeCallbacks(repush)
                     handler.postDelayed(repush, REPUSH_MS)
+                    handler.removeCallbacks(rediscover)
+                    handler.postDelayed(rediscover, REDISCOVER_MS)
                     Log.i(TAG, "mDNS browse started")
                 }
             }
 
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
                 handler.post {
+                    if (browseListener !== this) return@post
                     Log.w(TAG, "mDNS browse failed to start: $errorCode")
                     browseListener = null
                     browsing = false
@@ -212,21 +229,33 @@ class ApRadio private constructor(private val context: Context) {
 
             override fun onServiceFound(info: NsdServiceInfo) {
                 handler.post {
+                    if (browseListener !== this) return@post
                     resolveQueue.add(info)
                     pumpResolve()
                 }
             }
 
             override fun onServiceLost(info: NsdServiceInfo) {
-                handler.post { serviceLost(info.serviceName) }
+                handler.post {
+                    if (browseListener !== this) return@post
+                    serviceLost(info.serviceName)
+                }
             }
 
             override fun onDiscoveryStopped(serviceType: String) {
-                handler.post { browsing = false; publishWifi() }
+                handler.post {
+                    if (browseListener !== this) return@post
+                    browsing = false
+                    publishWifi()
+                }
             }
 
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-                handler.post { browsing = false; publishWifi() }
+                handler.post {
+                    if (browseListener !== this) return@post
+                    browsing = false
+                    publishWifi()
+                }
             }
         }
         browseListener = listener
@@ -238,6 +267,7 @@ class ApRadio private constructor(private val context: Context) {
         browseListener = null
         browsing = false
         handler.removeCallbacks(repush)
+        handler.removeCallbacks(rediscover)
         resolveQueue.clear()
         // The LAN is gone with the link: tell the core so it closes the pooled
         // UDP sessions instead of re-using dead sockets.
@@ -337,6 +367,28 @@ class ApRadio private constructor(private val context: Context) {
                 rotate(npub)
             }
             handler.postDelayed(this, REPUSH_MS)
+        }
+    }
+
+    /** Periodic mDNS self-heal. NsdManager routinely drops a service with a
+     *  spurious onServiceLost and then never re-announces it, which strands a
+     *  peer that is still on the LAN: [serviceLost] has removed it from every
+     *  map, [repush] has nothing left to rotate, and BLE may be down too, so
+     *  nothing re-dials — connectivity does not recover on its own.
+     *
+     *  Restarting discovery with a fresh listener makes NsdManager re-report
+     *  every service actually present now, so a dropped-but-live peer is
+     *  re-found, re-resolved and re-pushed. The peer maps are left intact and
+     *  no [awarePeerLost] is sent, so a healthy UDP session is untouched and a
+     *  still-present peer just re-pushes its address (deduped in [push]). */
+    private val rediscover = object : Runnable {
+        override fun run() {
+            if (browseListener != null && wifiNets.isNotEmpty()) {
+                browseListener?.let { runCatching { nsd.stopServiceDiscovery(it) } }
+                browseListener = null
+                startBrowse()
+            }
+            handler.postDelayed(this, REDISCOVER_MS)
         }
     }
 
@@ -559,6 +611,10 @@ class ApRadio private constructor(private val context: Context) {
 
         /** Retry cadence for an advert that could not be registered yet. */
         private const val ADVERT_RETRY_MS = 5_000L
+
+        /** How often the mDNS browse is restarted to recover peers NsdManager
+         *  dropped and never re-announced (see [rediscover]). */
+        private const val REDISCOVER_MS = 60_000L
 
         private val _wifi = MutableStateFlow(WifiApView())
         private val _nodes = MutableStateFlow<List<LanFipsNode>>(emptyList())

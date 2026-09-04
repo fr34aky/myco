@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and they go out the same encrypted mesh transfer the system Sharesheet
   uses — to the contact's npub, over whatever path reaches them, without
   needing a shared Wi-Fi.
+### Fixed
+
+- Same-Wi-Fi peers that dropped off mDNS now reconnect on their own: the
+  discovery browse restarts periodically so a peer the phone quietly stopped
+  reporting is found again, instead of the connection staying dead.
+
+### Added
 - Phones on the same Wi-Fi now find each other over the network instead of
   Bluetooth. Myco announces itself on the local network the same way a fips
   node does, so two phones — or a phone and a desktop — on one Wi-Fi connect
