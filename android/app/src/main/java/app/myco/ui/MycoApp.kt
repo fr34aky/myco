@@ -48,6 +48,8 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -109,6 +111,16 @@ private val TABS = listOf(
     Tab("discover", "Discover", Icons.Filled.TravelExplore),
     Tab("settings", "Settings", Icons.Filled.Settings),
     Tab("dev", "Dev", Icons.Filled.Terminal),
+)
+
+/**
+ * Picked share URIs across a configuration change. A `Uri` is Parcelable, but the
+ * list handed back by the picker is not guaranteed to be a shape the default saver
+ * can store, so save the strings and parse them back.
+ */
+private val UriListSaver = listSaver<List<Uri>, String>(
+    save = { it.map(Uri::toString) },
+    restore = { it.map(Uri::parse) },
 )
 
 @Composable
@@ -237,6 +249,20 @@ fun MycoApp(
     }
 
     val nav = rememberNavController()
+    // "Send a file" from a Circle contact: remember who, then let the user pick what.
+    // Saveable, not merely remembered: the document picker is another activity, and
+    // a rotation behind it — or the sheet rotating afterwards — would otherwise drop
+    // the contact and the picks on the floor, leaving the user to start over with no
+    // sign of why.
+    var sendFileNpub by rememberSaveable { mutableStateOf<String?>(null) }
+    var pickedShareUris by rememberSaveable(stateSaver = UriListSaver) {
+        mutableStateOf<List<Uri>>(emptyList())
+    }
+    val pickFilesForPeer = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) pickedShareUris = uris else sendFileNpub = null
+    }
     // Keep the navigation host and all transient surfaces in one app-root layer.
     // File offers must not be owned by Circle or any other selected destination.
     Box(Modifier.fillMaxSize()) {
@@ -299,7 +325,15 @@ fun MycoApp(
                     AppsScreen(state, client, onLaunchNsite = onLaunchNsite, onPinToHome = onPinToHome, onScanned = onScanned)
                 }
                 composable("circle") {
-                    CircleScreen(state, client, onOpenQr = { nav.navigate("qr") })
+                    CircleScreen(
+                        state,
+                        client,
+                        onOpenQr = { nav.navigate("qr") },
+                        onSendFile = { peer ->
+                            sendFileNpub = peer.npub
+                            pickFilesForPeer.launch(arrayOf("*/*"))
+                        },
+                    )
                 }
                 composable("discover") { DiscoverScreen(state, client, onLaunchNsite = onLaunchNsite) }
                 composable("settings") {
@@ -430,14 +464,25 @@ fun MycoApp(
         )
     }
 
+    // Files come either from Android's Sharesheet (peer chosen afterwards) or from
+    // a contact's sheet on the Circle tab (peer chosen first, files picked here).
+    // Both end in the same sheet; the Circle path just arrives with a preselection.
+    val shareUris = externalShareUris.ifEmpty { pickedShareUris }
     var peerShareVisible by remember { mutableStateOf(false) }
-    androidx.compose.runtime.LaunchedEffect(externalShareUris) {
-        if (externalShareUris.isNotEmpty()) peerShareVisible = true
+    androidx.compose.runtime.LaunchedEffect(shareUris) {
+        if (shareUris.isNotEmpty()) peerShareVisible = true
     }
-    if (peerShareVisible && externalShareUris.isNotEmpty()) {
+    if (peerShareVisible && shareUris.isNotEmpty()) {
         PeerShareSheet(
             state = state,
-            uris = externalShareUris,
+            uris = shareUris,
+            // Only if they are still there: a contact can drop off the mesh between
+            // the tap and the picker closing, and a preselection the picker then
+            // hides under "offline" is a selection the user cannot see.
+            preselectedNpub = sendFileNpub?.takeIf {
+                externalShareUris.isEmpty() &&
+                    (it in state.reachableNpubs || state.blePeers.any { p -> p.npub == it && p.connected })
+            },
             onDismiss = {
                 peerShareVisible = false
                 // Closing the sheet acknowledges the outcomes it was showing.
@@ -449,9 +494,11 @@ fun MycoApp(
                     .filter { it.status == "cancelled" || it.status == "denied" }
                     .forEach { client.dispatch(NativeActions.forgetFileTransfer(it.id)) }
                 state = client.state()
+                pickedShareUris = emptyList()
+                sendFileNpub = null
                 onExternalShareDismissed()
             },
-            onShare = { peer -> onShareToPeer(externalShareUris, peer) },
+            onShare = { peer -> onShareToPeer(shareUris, peer) },
             onCancelTransfer = {
                 state = client.dispatch(NativeActions.cancelFileTransfer(it.id))
             },

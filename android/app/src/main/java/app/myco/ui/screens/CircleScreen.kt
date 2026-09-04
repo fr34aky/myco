@@ -28,6 +28,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Contactless
 import androidx.compose.material.icons.filled.ChevronRight
@@ -112,6 +113,8 @@ fun CircleScreen(
     state: AppState,
     client: AppCoreClient,
     onOpenQr: () -> Unit,
+    /** "Send a file" from a contact's sheet: pick documents, then offer them to this peer over the mesh. */
+    onSendFile: (CircleContact) -> Unit = {},
 ) {
     val context = LocalContext.current
     var name by remember(state.ownNpub) { mutableStateOf(DeviceName.current(context, state.ownNpub)) }
@@ -154,6 +157,9 @@ fun CircleScreen(
     }
 
     val connected = state.blePeers.filter { it.connected }.map { it.npub }.toSet()
+    // Who a file could actually reach right now — any mesh lane, not just BLE.
+    // The share sheet's picker partitions on the same test.
+    val reachable = state.reachableNpubs + connected
     // Who we have already invited, from the core rather than a list local to this
     // screen: an invite outlives leaving the tab, and the core is what refuses to
     // send a second one — the badge should agree with it.
@@ -428,6 +434,8 @@ fun CircleScreen(
         ModalBottomSheet(onDismissRequest = { sheetFor = null }) {
             PersonSheet(
                 contact = c,
+                canSendFile = c.npub in reachable,
+                onSendFile = { sheetFor = null; onSendFile(c) },
                 onRemove = { sheetFor = null; confirmRemove = c },
             )
         }
@@ -480,6 +488,9 @@ fun CircleScreen(
 @Composable
 private fun PersonSheet(
     contact: CircleContact,
+    /** False when no lane reaches them: a file has nowhere to go, so we do not offer one. */
+    canSendFile: Boolean,
+    onSendFile: () -> Unit,
     onRemove: () -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp)) {
@@ -498,6 +509,7 @@ private fun PersonSheet(
         }
         Spacer(Modifier.height(16.dp))
         SheetAction(Icons.Filled.Info, shortNpub(contact.npub)) { }
+        if (canSendFile) SheetAction(Icons.Filled.AttachFile, "Send a file") { onSendFile() }
         SheetAction(Icons.Filled.PersonRemove, "Remove from circle", tint = MaterialTheme.colorScheme.error) { onRemove() }
     }
 }
