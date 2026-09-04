@@ -23,7 +23,7 @@ use jni::sys::{jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
 
 use fips::transport::ble::addr::BleAddr;
-use fips::transport::ble::android_io::{AndroidBleBridge, AndroidRadio, BleRadioSlot};
+use fips::transport::ble::io_android::{AndroidBleBridge, AndroidRadio, BleRadioSlot};
 
 /// Process-wide JavaVM, captured in `initializeAndroidContext`. Needed to attach
 /// tokio worker threads to the JVM before issuing control upcalls.
